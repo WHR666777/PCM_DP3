@@ -13,8 +13,12 @@ dp3_task: demo_task
 expert_data_num: null
 use_rgb: false
 use_semantic_mask: true
-dinov2_head_path: "/root/autodl-tmp/RoboTwin/policy/my_DP3/3D-Diffusion-Policy/checkpoints/dinov2_linear_head.pth"
-tide_enabled: true
-tide_threshold_path: "/root/autodl-tmp/RoboTwin/policy/my_DP3/debug_pcd/tide/tide_threshold.json"
-tide_output_dir: "/root/autodl-tmp/RoboTwin/policy/my_DP3/debug_pcd/tide"
+dinov2_head_path: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/3D-Diffusion-Policy/checkpoints/dinov2_linear_head.pth"
+dbscan_eps: 0.04
+dbscan_min_points: 150
+target_point_num: 1024
+tide_enabled: false
+tide_threshold_path: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/debug_pcd/tide/tide_threshold.json"
+tide_output_dir: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/debug_pcd/tide"
 tide_min_consecutive_fail: 2
+rewind_enabled: false
