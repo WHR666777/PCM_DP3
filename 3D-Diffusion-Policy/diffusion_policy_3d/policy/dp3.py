@@ -258,6 +258,7 @@ class DP3(BasePolicy):
         result = {
             "action": action,
             "action_pred": action_pred,
+            "obs_feature": global_cond if global_cond is not None else nobs_features.reshape(B, -1),
         }
 
         return result

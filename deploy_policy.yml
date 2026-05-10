@@ -13,8 +13,34 @@ dp3_task: demo_task
 expert_data_num: null
 use_rgb: false
 use_semantic_mask: true
-dinov2_head_path: "/root/autodl-tmp/RoboTwin/policy/my_DP3/3D-Diffusion-Policy/checkpoints/dinov2_linear_head.pth"
+dinov2_head_path: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/3D-Diffusion-Policy/checkpoints/dinov2_linear_head.pth"
 tide_enabled: true
-tide_threshold_path: "/root/autodl-tmp/RoboTwin/policy/my_DP3/debug_pcd/tide/tide_threshold.json"
-tide_output_dir: "/root/autodl-tmp/RoboTwin/policy/my_DP3/debug_pcd/tide"
+tide_threshold_path: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/debug_pcd/tide/tide_threshold.json"
+tide_output_dir: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/debug_pcd/tide"
 tide_min_consecutive_fail: 2
+rewind_enabled: false
+rewind_checkpoint_db_path: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/debug_pcd/rewind/rewind_checkpoint_db.npz"
+rewind_output_dir: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/debug_pcd/rewind"
+rewind_peak_gap: 2
+rewind_min_similarity: 0.55
+rewind_min_likelihood: -1.0e18
+rewind_slot_order:
+  - pre_reach
+  - pre_grasp
+  - grasp_ready
+  - pre_place
+  - lift_ready
+rewind_min_stage_dwell: 2
+rewind_likelihood_margin: 0.05
+rewind_allow_stage_skip: 1
+rewind_min_consecutive_fail: 2
+rewind_cooldown_steps: 12
+rewind_max_recovery_attempts: 1
+rewind_recovery_interp_steps: 4
+rewind_warmup_obs_steps: 3
+rewind_force_recovery: false
+rewind_force_recovery_env_step: -1
+rewind_force_recovery_infer_idx: -1
+rewind_force_recovery_slot: ""
+rewind_force_recovery_once: true
+rewind_dry_run: true

@@ -81,6 +81,25 @@ EE_LOCK_ROTATION = False
 TIDE_OUTPUT_DIR = os.path.join("debug_pcd", "tide")
 TIDE_THRESHOLD_PATH = os.path.join(TIDE_OUTPUT_DIR, "tide_threshold.json")
 TIDE_MIN_CONSECUTIVE_FAIL = 2
+REWIND_CHECKPOINT_DB_PATH = os.path.join("debug_pcd", "rewind", "rewind_checkpoint_db.npz")
+REWIND_OUTPUT_DIR = os.path.join("debug_pcd", "rewind")
+REWIND_PEAK_GAP = 2
+REWIND_MIN_SIMILARITY = 0.55
+REWIND_MIN_LIKELIHOOD = -1.0e18
+REWIND_SLOT_ORDER = ["pre_reach", "pre_grasp", "grasp_ready", "pre_place", "lift_ready"]
+REWIND_MIN_STAGE_DWELL = 2
+REWIND_LIKELIHOOD_MARGIN = 0.05
+REWIND_ALLOW_STAGE_SKIP = 1
+REWIND_MIN_CONSECUTIVE_FAIL = 2
+REWIND_COOLDOWN_STEPS = 12
+REWIND_MAX_RECOVERY_ATTEMPTS = 1
+REWIND_RECOVERY_INTERP_STEPS = 4
+REWIND_WARMUP_OBS_STEPS = 3
+REWIND_FORCE_RECOVERY = False
+REWIND_FORCE_RECOVERY_ENV_STEP = -1
+REWIND_FORCE_RECOVERY_INFER_IDX = -1
+REWIND_FORCE_RECOVERY_SLOT = ""
+REWIND_FORCE_RECOVERY_ONCE = True
 
 
 def normalize_quat(q):
@@ -100,6 +119,24 @@ def quat_multiply(a, b):
         ],
         dtype=np.float64,
     )
+
+
+def quat_slerp(q0, q1, t):
+    q0 = normalize_quat(q0)
+    q1 = normalize_quat(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = np.clip(dot, -1.0, 1.0)
+    if dot > 0.9995:
+        return normalize_quat(q0 + t * (q1 - q0))
+    theta_0 = np.arccos(dot)
+    sin_theta_0 = np.sin(theta_0)
+    theta = theta_0 * t
+    s0 = np.sin(theta_0 - theta) / max(sin_theta_0, 1e-12)
+    s1 = np.sin(theta) / max(sin_theta_0, 1e-12)
+    return normalize_quat(s0 * q0 + s1 * q1)
 
 
 def quat_to_matrix(q):
@@ -481,6 +518,55 @@ def build_debug_video_frame(observation, obs, model):
         cv2.putText(frame, state_text, (frame.shape[1] - 90, frame.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.9, state_color, 2)
         if is_failing:
             cv2.rectangle(frame, (1, 1), (frame.shape[1] - 2, frame.shape[0] - 2), (255, 60, 60), 4)
+
+    rewind_overlay = getattr(model, "rewind_overlay", None)
+    if rewind_overlay is not None:
+        slot = rewind_overlay.get("best_slot", "none")
+        score = float(rewind_overlay.get("best_score", math.nan))
+        score_mode = rewind_overlay.get("score_mode", "score")
+        peaked = rewind_overlay.get("peaked_slot", "none")
+        stage = rewind_overlay.get("stage_slot", "none")
+        status = rewind_overlay.get("status", "OK")
+        score_text = "nan" if np.isnan(score) else f"{score:.3f}"
+        status_color = (255, 200, 70)
+        if status == "RECOVERING":
+            status_color = (255, 80, 80)
+        elif status == "COOLDOWN":
+            status_color = (80, 190, 255)
+        elif status == "OK":
+            status_color = (80, 230, 120)
+        rewind_text = f"Rewind slot={slot} stage={stage} {score_mode}={score_text} peaked={peaked}"
+        text_x = 14
+        text_y = frame.shape[0] - bar_h - 10
+        text_size, _ = cv2.getTextSize(rewind_text, cv2.FONT_HERSHEY_SIMPLEX, 0.54, 2)
+        box_x0 = max(0, text_x - 8)
+        box_y0 = max(0, text_y - text_size[1] - 8)
+        box_x1 = min(frame.shape[1] - 1, text_x + text_size[0] + 8)
+        box_y1 = min(frame.shape[0] - 1, text_y + 8)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (box_x0, box_y0), (box_x1, box_y1), (18, 18, 18), -1)
+        frame[:] = cv2.addWeighted(overlay, 0.78, frame, 0.22, 0)
+        cv2.putText(
+            frame,
+            rewind_text,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.54,
+            (0, 0, 0),
+            4,
+        )
+        cv2.putText(
+            frame,
+            rewind_text,
+            (text_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.54,
+            (255, 255, 255),
+            2,
+        )
+        status_x = min(frame.shape[1] - 190, box_x1 + 18)
+        cv2.putText(frame, status, (status_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4)
+        cv2.putText(frame, status, (status_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, status_color, 2)
     return frame
 
 
@@ -787,6 +873,463 @@ def finalize_tide_episode(model):
     print(f"DP-TIDE curve: {curve_path}")
     print(f"DP-TIDE summary: {summary_path}")
     print(f"DP-TIDE segments: {segments_path}")
+
+
+def _normalize_feature(feature):
+    feature = np.asarray(feature, dtype=np.float64).reshape(-1)
+    norm = np.linalg.norm(feature)
+    if norm < 1e-12:
+        return feature
+    return feature / norm
+
+
+def load_rewind_checkpoint_db(db_path):
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(f"Rewind checkpoint db not found: {db_path}")
+    data = np.load(db_path, allow_pickle=True)
+    required = ["slot_names", "features", "recovery_actions"]
+    for key in required:
+        if key not in data:
+            raise KeyError(f"{db_path} missing required array: {key}")
+
+    slot_names = np.asarray(data["slot_names"]).astype(str)
+    features = np.asarray(data["features"], dtype=np.float64)
+    recovery_actions = np.asarray(data["recovery_actions"], dtype=np.float64)
+    if features.ndim != 2:
+        features = features.reshape(features.shape[0], -1)
+    if recovery_actions.ndim != 2 or recovery_actions.shape[1] != 20:
+        raise ValueError(f"recovery_actions must have shape (N, 20), got {recovery_actions.shape}")
+    if slot_names.shape[0] != features.shape[0] or slot_names.shape[0] != recovery_actions.shape[0]:
+        raise ValueError("Rewind db arrays length mismatch.")
+
+    feature_norms = np.linalg.norm(features, axis=1, keepdims=True)
+    features = features / np.clip(feature_norms, 1e-12, None)
+    source_episodes = np.asarray(data["source_episodes"]).astype(str) if "source_episodes" in data else np.array([""] * len(slot_names))
+    frame_indices = np.asarray(data["frame_indices"], dtype=np.int64) if "frame_indices" in data else np.full(len(slot_names), -1)
+    db = {
+        "slot_names": slot_names,
+        "features": features,
+        "recovery_actions": recovery_actions,
+        "source_episodes": source_episodes,
+        "frame_indices": frame_indices,
+    }
+    if "pca_mean" in data and "pca_components" in data and "pca_features" in data:
+        db["pca_mean"] = np.asarray(data["pca_mean"], dtype=np.float64).reshape(-1)
+        db["pca_components"] = np.asarray(data["pca_components"], dtype=np.float64)
+        db["pca_features"] = np.asarray(data["pca_features"], dtype=np.float64)
+        bandwidth = np.asarray(data["kde_bandwidth"], dtype=np.float64).reshape(-1)[0] if "kde_bandwidth" in data else 1.0
+        db["kde_bandwidth"] = max(float(bandwidth), 1e-6)
+        db["score_mode"] = "pca_kde"
+    else:
+        db["score_mode"] = "cosine"
+    return db
+
+
+def gaussian_kde_log_likelihood(query, samples, bandwidth):
+    samples = np.asarray(samples, dtype=np.float64)
+    query = np.asarray(query, dtype=np.float64).reshape(1, -1)
+    if samples.ndim != 2 or samples.shape[0] == 0:
+        return -float("inf"), -1
+    diff = samples - query
+    sq_dist = np.sum(diff * diff, axis=1)
+    log_kernel = -0.5 * sq_dist / max(float(bandwidth) ** 2, 1e-12)
+    max_log = float(np.max(log_kernel))
+    log_likelihood = max_log + math.log(float(np.mean(np.exp(log_kernel - max_log))))
+    nearest_local_idx = int(np.argmax(log_kernel))
+    return float(log_likelihood), nearest_local_idx
+
+
+def rewind_score_slots(db, feature):
+    if db.get("score_mode") == "pca_kde":
+        if feature.shape[0] != db["pca_mean"].shape[0]:
+            raise ValueError(
+                f"Rewind feature dim mismatch: online={feature.shape[0]}, db={db['pca_mean'].shape[0]}"
+            )
+        z = (feature - db["pca_mean"]) @ db["pca_components"].T
+        scores = {}
+        sample_indices = {}
+        for slot in sorted(set(db["slot_names"].tolist())):
+            idx = np.where(db["slot_names"] == slot)[0]
+            score, local_idx = gaussian_kde_log_likelihood(z, db["pca_features"][idx], db["kde_bandwidth"])
+            scores[slot] = score
+            sample_indices[slot] = int(idx[local_idx]) if local_idx >= 0 else -1
+        return scores, sample_indices, "likelihood"
+
+    sims = db["features"] @ _normalize_feature(feature)
+    scores = {}
+    sample_indices = {}
+    for slot in sorted(set(db["slot_names"].tolist())):
+        idx = np.where(db["slot_names"] == slot)[0]
+        local_sims = sims[idx]
+        local_best = int(np.argmax(local_sims))
+        scores[slot] = float(local_sims[local_best])
+        sample_indices[slot] = int(idx[local_best])
+    return scores, sample_indices, "cosine"
+
+
+def init_rewind_runtime_if_needed(model):
+    if hasattr(model, "rewind_runtime_initialized"):
+        return
+    model.rewind_runtime_initialized = True
+    model.rewind_output_dir = getattr(model, "rewind_output_dir", REWIND_OUTPUT_DIR)
+    os.makedirs(model.rewind_output_dir, exist_ok=True)
+    model.rewind_db = load_rewind_checkpoint_db(model.rewind_checkpoint_db_path)
+    model.rewind_slot_state = {}
+    db_slots = sorted(set(model.rewind_db["slot_names"].tolist()))
+    configured_order = list(getattr(model, "rewind_slot_order", REWIND_SLOT_ORDER))
+    ordered_slots = [slot for slot in configured_order if slot in db_slots]
+    ordered_slots.extend([slot for slot in db_slots if slot not in ordered_slots])
+    model.rewind_slot_order = ordered_slots
+    for slot in db_slots:
+        model.rewind_slot_state[slot] = {
+            "best_score": -float("inf"),
+            "best_infer_idx": -1,
+            "best_template_idx": -1,
+            "recovery_action20": None,
+            "peaked": False,
+            "peaked_at": -1,
+        }
+    if not hasattr(model, "rewind_episode_idx_seeded"):
+        model.rewind_episode_idx = _next_episode_index_by_scan(model.rewind_output_dir, "rewind_events_episode")
+        model.rewind_episode_idx_seeded = True
+    model.rewind_events = []
+    model.rewind_consecutive_fail = 0
+    model.rewind_cooldown_remaining = 0
+    model.rewind_recovery_attempts = 0
+    model.rewind_confirmed_stage_idx = -1
+    model.rewind_candidate_stage = None
+    model.rewind_candidate_dwell = 0
+    model.rewind_last_confirmed_slot = None
+    model.rewind_overlay = {
+        "best_slot": "none",
+        "best_score": math.nan,
+        "score_mode": model.rewind_db.get("score_mode", "cosine"),
+        "peaked_slot": "none",
+        "status": "OK",
+    }
+    print(
+        f"Rewind enabled. db={model.rewind_checkpoint_db_path}, "
+        f"slots={model.rewind_slot_order}, score={model.rewind_db.get('score_mode')}, output={model.rewind_output_dir}"
+    )
+
+
+def update_rewind_tracker(model, action_meta):
+    init_rewind_runtime_if_needed(model)
+    if action_meta is None or "obs_feature" not in action_meta:
+        raise RuntimeError("Rewind enabled but obs_feature metadata is unavailable.")
+
+    feature = _normalize_feature(np.asarray(action_meta["obs_feature"]).squeeze(0))
+    db = model.rewind_db
+    scores, sample_indices, score_name = rewind_score_slots(db, feature)
+    infer_idx = int(getattr(model, "tide_infer_idx", 0))
+    best_slot = max(scores, key=scores.get)
+    best_score = float(scores[best_slot])
+
+    for slot, state in model.rewind_slot_state.items():
+        if slot not in scores:
+            continue
+        score = float(scores[slot])
+        template_idx = int(sample_indices[slot])
+        if score > state["best_score"]:
+            state["best_score"] = score
+            state["best_infer_idx"] = infer_idx
+            state["best_template_idx"] = template_idx
+            state["recovery_action20"] = db["recovery_actions"][template_idx].astype(np.float32)
+            state["peaked"] = False
+            state["peaked_at"] = -1
+    stage_slot, stage_score = update_rewind_stage_machine(model, scores, score_name, infer_idx)
+    peaked_slot = select_rewind_recovery_slot(model)
+    model.rewind_overlay = {
+        "best_slot": best_slot,
+        "best_score": best_score,
+        "score_mode": score_name,
+        "peaked_slot": peaked_slot if peaked_slot is not None else "none",
+        "stage_slot": stage_slot if stage_slot is not None else "none",
+        "stage_score": stage_score,
+        "status": "COOLDOWN" if getattr(model, "rewind_cooldown_remaining", 0) > 0 else "OK",
+    }
+    return best_slot, best_score, peaked_slot
+
+
+def update_rewind_stage_machine(model, scores, score_name, infer_idx):
+    order = list(getattr(model, "rewind_slot_order", []))
+    if len(order) == 0:
+        return None, math.nan
+
+    confirmed_idx = int(getattr(model, "rewind_confirmed_stage_idx", -1))
+    allow_skip = max(0, int(getattr(model, "rewind_allow_stage_skip", REWIND_ALLOW_STAGE_SKIP)))
+    start_idx = max(0, confirmed_idx)
+    end_idx = min(len(order) - 1, confirmed_idx + allow_skip if confirmed_idx >= 0 else allow_skip)
+    allowed = [slot for slot in order[start_idx:end_idx + 1] if slot in scores]
+    if len(allowed) == 0:
+        allowed = [slot for slot in order if slot in scores]
+
+    stage_slot = max(allowed, key=lambda slot: scores[slot])
+    stage_score = float(scores[stage_slot])
+    stage_idx = order.index(stage_slot)
+
+    if confirmed_idx >= 0 and stage_idx > confirmed_idx:
+        current_slot = order[confirmed_idx]
+        current_score = float(scores.get(current_slot, -float("inf")))
+        if stage_score < current_score + float(getattr(model, "rewind_likelihood_margin", REWIND_LIKELIHOOD_MARGIN)):
+            stage_slot = current_slot
+            stage_score = current_score
+            stage_idx = confirmed_idx
+
+    if not rewind_score_passes_threshold(model, stage_score, score_name):
+        return stage_slot, stage_score
+
+    if getattr(model, "rewind_candidate_stage", None) == stage_slot:
+        model.rewind_candidate_dwell += 1
+    else:
+        model.rewind_candidate_stage = stage_slot
+        model.rewind_candidate_dwell = 1
+
+    min_dwell = max(1, int(getattr(model, "rewind_min_stage_dwell", REWIND_MIN_STAGE_DWELL)))
+    if model.rewind_candidate_dwell >= min_dwell and stage_idx > confirmed_idx:
+        model.rewind_confirmed_stage_idx = stage_idx
+        model.rewind_last_confirmed_slot = stage_slot
+        state = model.rewind_slot_state[stage_slot]
+        state["peaked"] = True
+        state["peaked_at"] = infer_idx
+        log_rewind_event(model, "stage_confirmed", selected_slot=stage_slot, score=stage_score)
+    return stage_slot, stage_score
+
+
+def rewind_score_passes_threshold(model, score, score_name):
+    if score_name == "likelihood":
+        return float(score) >= float(getattr(model, "rewind_min_likelihood", REWIND_MIN_LIKELIHOOD))
+    return float(score) >= float(getattr(model, "rewind_min_similarity", REWIND_MIN_SIMILARITY))
+
+
+def select_rewind_recovery_slot(model):
+    slot = getattr(model, "rewind_last_confirmed_slot", None)
+    if slot is None:
+        return None
+    state = getattr(model, "rewind_slot_state", {}).get(slot)
+    if state is None or state.get("recovery_action20") is None:
+        return None
+    return slot
+
+
+def ensure_rewind_slot_action(model, slot):
+    if slot is None or slot == "":
+        return None
+    state = getattr(model, "rewind_slot_state", {}).get(slot)
+    if state is None:
+        return None
+    if state.get("recovery_action20") is not None:
+        return slot
+    db = getattr(model, "rewind_db", None)
+    if db is None:
+        return None
+    idx = np.where(db["slot_names"] == slot)[0]
+    if idx.size == 0:
+        return None
+    template_idx = int(idx[0])
+    state["best_template_idx"] = template_idx
+    state["recovery_action20"] = db["recovery_actions"][template_idx].astype(np.float32)
+    if not np.isfinite(state.get("best_score", -float("inf"))):
+        state["best_score"] = 0.0
+    return slot
+
+
+def log_rewind_event(model, event_type, **kwargs):
+    if not getattr(model, "rewind_enabled", False):
+        return
+    row = {
+        "episode_id": int(getattr(model, "rewind_episode_idx", getattr(model, "tide_episode_idx", 0))),
+        "infer_idx": int(getattr(model, "tide_infer_idx", -1)),
+        "env_step": int(getattr(model, "tide_env_step_count", 0)),
+        "event_type": event_type,
+        "selected_slot": kwargs.pop("selected_slot", ""),
+        "score": kwargs.pop("score", kwargs.pop("similarity", math.nan)),
+        "score_mode": kwargs.pop("score_mode", getattr(model, "rewind_db", {}).get("score_mode", "")),
+        "cooldown_remaining": int(getattr(model, "rewind_cooldown_remaining", 0)),
+        "dry_run": int(bool(getattr(model, "rewind_dry_run", False))),
+    }
+    row.update(kwargs)
+    model.rewind_events.append(row)
+
+
+def should_force_rewind(model):
+    if not getattr(model, "rewind_enabled", False) or not getattr(model, "rewind_force_recovery", False):
+        return False, None
+    if getattr(model, "rewind_force_recovery_once", True) and getattr(model, "rewind_force_recovery_used", False):
+        return False, None
+    env_step = int(getattr(model, "tide_env_step_count", 0))
+    infer_idx = int(getattr(model, "tide_infer_idx", 0))
+    force_env = int(getattr(model, "rewind_force_recovery_env_step", REWIND_FORCE_RECOVERY_ENV_STEP))
+    force_infer = int(getattr(model, "rewind_force_recovery_infer_idx", REWIND_FORCE_RECOVERY_INFER_IDX))
+    env_hit = force_env >= 0 and env_step >= force_env
+    infer_hit = force_infer >= 0 and infer_idx >= force_infer
+    if not env_hit and not infer_hit:
+        return False, None
+    requested_slot = str(getattr(model, "rewind_force_recovery_slot", "") or "")
+    slot = ensure_rewind_slot_action(model, requested_slot) if requested_slot else select_rewind_recovery_slot(model)
+    if slot is None:
+        log_rewind_event(model, "force_no_recovery_target", selected_slot=requested_slot)
+        model.rewind_force_recovery_used = bool(getattr(model, "rewind_force_recovery_once", True))
+        return False, None
+    model.rewind_force_recovery_used = True
+    log_rewind_event(model, "force_recovery_trigger", selected_slot=slot)
+    return True, slot
+
+
+def should_trigger_rewind(model, tide_chunk_failing):
+    if not getattr(model, "rewind_enabled", False):
+        return False, None
+    init_rewind_runtime_if_needed(model)
+    if getattr(model, "rewind_cooldown_remaining", 0) > 0:
+        model.rewind_cooldown_remaining -= 1
+        model.rewind_overlay["status"] = "COOLDOWN"
+        return False, None
+
+    if tide_chunk_failing:
+        model.rewind_consecutive_fail += 1
+    else:
+        model.rewind_consecutive_fail = 0
+        return False, None
+
+    if model.rewind_consecutive_fail < int(model.rewind_min_consecutive_fail):
+        return False, None
+
+    slot = select_rewind_recovery_slot(model)
+    if slot is None:
+        log_rewind_event(model, "no_recovery_target")
+        return False, None
+    state = model.rewind_slot_state[slot]
+    score_name = "likelihood" if getattr(model, "rewind_db", {}).get("score_mode") == "pca_kde" else "cosine"
+    if not rewind_score_passes_threshold(model, state["best_score"], score_name):
+        log_rewind_event(model, "target_score_too_low", selected_slot=slot, score=float(state["best_score"]))
+        return False, None
+    return True, slot
+
+
+def execute_rewind_recovery(TASK_ENV, model, observation, slot):
+    state = model.rewind_slot_state[slot]
+    recovery_action20 = np.asarray(state["recovery_action20"], dtype=np.float32)
+    score = float(state["best_score"])
+    log_rewind_event(model, "recover_start", selected_slot=slot, score=score)
+    model.rewind_overlay["status"] = "RECOVERING"
+
+    if getattr(model, "rewind_dry_run", False):
+        print(f"Rewind dry-run: would recover to slot={slot}, score={score:.4f}")
+        log_rewind_event(model, "recover_dry_run", selected_slot=slot, score=score)
+        model.rewind_consecutive_fail = 0
+        model.rewind_cooldown_remaining = int(model.rewind_cooldown_steps)
+        return observation, encode_obs(observation, model)
+
+    if int(getattr(model, "rewind_recovery_attempts", 0)) >= int(model.rewind_max_recovery_attempts):
+        log_rewind_event(model, "unrecoverable", selected_slot=slot, score=score, reason="max_attempts")
+        return observation, encode_obs(observation, model)
+
+    interp_steps = max(1, int(getattr(model, "rewind_recovery_interp_steps", REWIND_RECOVERY_INTERP_STEPS)))
+    target_ee_action = convert_model_action_to_ee_action(recovery_action20, observation, model.task_center)
+    current_left = get_endpose(observation, "left")
+    current_right = get_endpose(observation, "right")
+    current_grippers = np.array([get_gripper(observation, "left"), get_gripper(observation, "right")], dtype=np.float64)
+
+    for step_idx in range(interp_steps):
+        alpha = float(step_idx + 1) / float(interp_steps)
+        left_target = target_ee_action[:7].astype(np.float64)
+        right_target = target_ee_action[8:15].astype(np.float64)
+        interp_left = np.concatenate(
+            [
+                current_left[:3] + alpha * (left_target[:3] - current_left[:3]),
+                quat_slerp(current_left[3:7], left_target[3:7], alpha),
+            ],
+            axis=0,
+        )
+        interp_right = np.concatenate(
+            [
+                current_right[:3] + alpha * (right_target[:3] - current_right[:3]),
+                quat_slerp(current_right[3:7], right_target[3:7], alpha),
+            ],
+            axis=0,
+        )
+        interp_grippers = current_grippers + alpha * (
+            np.array([target_ee_action[7], target_ee_action[15]], dtype=np.float64) - current_grippers
+        )
+        ee_action = np.concatenate(
+            [
+                interp_left,
+                np.array([interp_grippers[0]], dtype=np.float64),
+                interp_right,
+                np.array([interp_grippers[1]], dtype=np.float64),
+            ],
+            axis=0,
+        ).astype(np.float32)
+        log_rewind_event(model, "recover_interp_step", selected_slot=slot, score=score, interp_step=step_idx + 1, interp_steps=interp_steps)
+        TASK_ENV.take_action(ee_action, action_type="ee")
+
+    raw_observation = TASK_ENV.get_obs()
+    recovered_observation = get_semantic_observation(TASK_ENV, model, raw_observation)
+    recovered_obs = encode_obs(recovered_observation, model)
+
+    model.env_runner.reset_obs()
+    warmup_steps = max(1, int(getattr(model, "rewind_warmup_obs_steps", REWIND_WARMUP_OBS_STEPS)))
+    for warmup_idx in range(warmup_steps):
+        if warmup_idx == 0:
+            warm_observation = recovered_observation
+            warm_obs = recovered_obs
+        else:
+            raw_warm_observation = TASK_ENV.get_obs()
+            warm_observation = get_semantic_observation(TASK_ENV, model, raw_warm_observation)
+            warm_obs = encode_obs(warm_observation, model)
+        model.update_obs(warm_obs)
+        recovered_observation = warm_observation
+        recovered_obs = warm_obs
+    model.tide_prev_action_pred = None
+    model.rewind_consecutive_fail = 0
+    model.rewind_cooldown_remaining = int(model.rewind_cooldown_steps)
+    model.rewind_recovery_attempts += 1
+    model.rewind_overlay["status"] = "COOLDOWN"
+    log_rewind_event(model, "recover_done", selected_slot=slot, score=score, interp_steps=interp_steps, warmup_obs_steps=warmup_steps)
+    print(f"Rewind recovered to slot={slot}, score={score:.4f}, interp_steps={interp_steps}, warmup_obs_steps={warmup_steps}")
+    return recovered_observation, recovered_obs
+
+
+def finalize_rewind_episode(model):
+    if not getattr(model, "rewind_enabled", False) or not hasattr(model, "rewind_runtime_initialized"):
+        return
+    out_dir = getattr(model, "rewind_output_dir", REWIND_OUTPUT_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    episode_id = int(getattr(model, "rewind_episode_idx", getattr(model, "tide_episode_idx", 0)))
+    events = getattr(model, "rewind_events", [])
+    events_path = make_non_overwrite_path(os.path.join(out_dir, f"rewind_events_episode{episode_id:04d}.csv"))
+    summary_path = make_non_overwrite_path(os.path.join(out_dir, f"rewind_summary_episode{episode_id:04d}.json"))
+
+    if len(events) > 0:
+        fieldnames = sorted(set().union(*[set(e.keys()) for e in events]))
+        with open(events_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for event in events:
+                writer.writerow(event)
+
+    slot_summary = {}
+    for slot, state in getattr(model, "rewind_slot_state", {}).items():
+        slot_summary[slot] = {
+            "best_score": float(state.get("best_score", math.nan)),
+            "best_infer_idx": int(state.get("best_infer_idx", -1)),
+            "peaked": bool(state.get("peaked", False)),
+            "peaked_at": int(state.get("peaked_at", -1)),
+        }
+    summary = {
+        "episode_id": episode_id,
+        "num_events": len(events),
+        "num_recoveries": int(sum(1 for e in events if e.get("event_type") == "recover_done")),
+        "dry_run": bool(getattr(model, "rewind_dry_run", False)),
+        "slot_order": list(getattr(model, "rewind_slot_order", [])),
+        "last_confirmed_slot": getattr(model, "rewind_last_confirmed_slot", None),
+        "slots": slot_summary,
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"Rewind summary: {summary_path}")
+    if len(events) > 0:
+        print(f"Rewind events: {events_path}")
 
 
 def filter_two_objects_dbscan(pcd, eps=DBSCAN_EPS, min_points=DBSCAN_MIN_POINTS):
@@ -1146,6 +1689,33 @@ def get_model(usr_args):
             f"output={DP3_Model.tide_output_dir}, min_fail={DP3_Model.tide_min_consecutive_fail}"
         )
 
+    DP3_Model.rewind_enabled = bool(usr_args.get("rewind_enabled", False))
+    DP3_Model.rewind_checkpoint_db_path = usr_args.get("rewind_checkpoint_db_path", REWIND_CHECKPOINT_DB_PATH)
+    DP3_Model.rewind_output_dir = usr_args.get("rewind_output_dir", REWIND_OUTPUT_DIR)
+    DP3_Model.rewind_peak_gap = int(usr_args.get("rewind_peak_gap", REWIND_PEAK_GAP))
+    DP3_Model.rewind_min_similarity = float(usr_args.get("rewind_min_similarity", REWIND_MIN_SIMILARITY))
+    DP3_Model.rewind_min_likelihood = float(usr_args.get("rewind_min_likelihood", REWIND_MIN_LIKELIHOOD))
+    DP3_Model.rewind_slot_order = list(usr_args.get("rewind_slot_order", REWIND_SLOT_ORDER))
+    DP3_Model.rewind_min_stage_dwell = int(usr_args.get("rewind_min_stage_dwell", REWIND_MIN_STAGE_DWELL))
+    DP3_Model.rewind_likelihood_margin = float(usr_args.get("rewind_likelihood_margin", REWIND_LIKELIHOOD_MARGIN))
+    DP3_Model.rewind_allow_stage_skip = int(usr_args.get("rewind_allow_stage_skip", REWIND_ALLOW_STAGE_SKIP))
+    DP3_Model.rewind_min_consecutive_fail = int(usr_args.get("rewind_min_consecutive_fail", REWIND_MIN_CONSECUTIVE_FAIL))
+    DP3_Model.rewind_cooldown_steps = int(usr_args.get("rewind_cooldown_steps", REWIND_COOLDOWN_STEPS))
+    DP3_Model.rewind_max_recovery_attempts = int(usr_args.get("rewind_max_recovery_attempts", REWIND_MAX_RECOVERY_ATTEMPTS))
+    DP3_Model.rewind_recovery_interp_steps = int(usr_args.get("rewind_recovery_interp_steps", REWIND_RECOVERY_INTERP_STEPS))
+    DP3_Model.rewind_warmup_obs_steps = int(usr_args.get("rewind_warmup_obs_steps", REWIND_WARMUP_OBS_STEPS))
+    DP3_Model.rewind_force_recovery = bool(usr_args.get("rewind_force_recovery", REWIND_FORCE_RECOVERY))
+    DP3_Model.rewind_force_recovery_env_step = int(usr_args.get("rewind_force_recovery_env_step", REWIND_FORCE_RECOVERY_ENV_STEP))
+    DP3_Model.rewind_force_recovery_infer_idx = int(usr_args.get("rewind_force_recovery_infer_idx", REWIND_FORCE_RECOVERY_INFER_IDX))
+    DP3_Model.rewind_force_recovery_slot = str(usr_args.get("rewind_force_recovery_slot", REWIND_FORCE_RECOVERY_SLOT) or "")
+    DP3_Model.rewind_force_recovery_once = bool(usr_args.get("rewind_force_recovery_once", REWIND_FORCE_RECOVERY_ONCE))
+    DP3_Model.rewind_dry_run = bool(usr_args.get("rewind_dry_run", True))
+    if DP3_Model.rewind_enabled:
+        print(
+            f"Rewind enabled. db={DP3_Model.rewind_checkpoint_db_path}, "
+            f"dry_run={DP3_Model.rewind_dry_run}, min_like={DP3_Model.rewind_min_likelihood}"
+        )
+
     return DP3_Model
 
 
@@ -1214,6 +1784,8 @@ def legacy_reset_model_unused(model):
 def eval(TASK_ENV, model, observation):
     if getattr(model, "tide_enabled", False):
         init_tide_runtime_if_needed(model)
+    if getattr(model, "rewind_enabled", False):
+        init_rewind_runtime_if_needed(model)
 
     if not hasattr(model, "task_center"):
         observation = initialize_task_center(TASK_ENV, model, observation)
@@ -1230,11 +1802,23 @@ def eval(TASK_ENV, model, observation):
         actions = model.get_action()
         action_meta = None
 
+    if getattr(model, "rewind_enabled", False):
+        update_rewind_tracker(model, action_meta)
+
     tide_chunk_failing = False
     if getattr(model, "tide_enabled", False):
         if action_meta is None or "action_pred" not in action_meta:
             raise RuntimeError("DP-TIDE enabled but action_pred metadata is unavailable.")
         tide_chunk_failing = update_tide_for_inference(model, action_meta, stride=actions.shape[0])
+
+    if getattr(model, "rewind_enabled", False):
+        do_recover, rewind_slot = should_force_rewind(model)
+        if not do_recover:
+            do_recover, rewind_slot = should_trigger_rewind(model, tide_chunk_failing)
+        if do_recover:
+            observation, obs = execute_rewind_recovery(TASK_ENV, model, observation, rewind_slot)
+            if not getattr(model, "rewind_dry_run", False):
+                return
 
     if not hasattr(model, "printed_action_shape"):
         print(f"model action shape: {actions.shape}")
@@ -1261,6 +1845,9 @@ def eval(TASK_ENV, model, observation):
 
 
 def reset_model(model):
+    if getattr(model, "rewind_enabled", False):
+        finalize_rewind_episode(model)
+        model.rewind_episode_idx = int(getattr(model, "rewind_episode_idx", getattr(model, "tide_episode_idx", 0))) + 1
     if getattr(model, "tide_enabled", False):
         finalize_tide_episode(model)
         model.tide_episode_idx = int(getattr(model, "tide_episode_idx", 0)) + 1
@@ -1288,6 +1875,19 @@ def reset_model(model):
         "tide_overlay",
         "printed_tide_overlap_warning",
         "tide_collect_only",
+        "rewind_runtime_initialized",
+        "rewind_db",
+        "rewind_slot_state",
+        "rewind_events",
+        "rewind_consecutive_fail",
+        "rewind_cooldown_remaining",
+        "rewind_recovery_attempts",
+        "rewind_overlay",
+        "rewind_confirmed_stage_idx",
+        "rewind_candidate_stage",
+        "rewind_candidate_dwell",
+        "rewind_last_confirmed_slot",
+        "rewind_force_recovery_used",
     ):
         if hasattr(model, attr):
             delattr(model, attr)
