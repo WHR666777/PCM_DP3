@@ -22,3 +22,4 @@ tide_threshold_path: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/debug_pcd/tide/ti
 tide_output_dir: "/root/autodl-tmp/RoboTwin/policy/PCM_DP3/debug_pcd/tide"
 tide_min_consecutive_fail: 2
 rewind_enabled: false
+test：false
